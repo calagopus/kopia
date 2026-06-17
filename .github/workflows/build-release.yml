@@ -1,0 +1,197 @@
+name: Build and Release Kopia
+
+on:
+  schedule:
+    - cron: "0 0 * * 0"
+  workflow_dispatch:
+    inputs:
+      kopia_version:
+        description: "Kopia version to build (e.g., v0.23.1). Leave empty to fetch latest."
+        required: false
+        type: string
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  get-version:
+    name: Get Kopia Version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - name: Determine Kopia version
+        id: version
+        run: |
+          if [ -n "${{ inputs.kopia_version }}" ]; then
+            VERSION="${{ inputs.kopia_version }}"
+          else
+            VERSION=$(curl -s https://api.github.com/repos/kopia/kopia/releases/latest | jq -r .tag_name)
+          fi
+          echo "version=${VERSION}" >> $GITHUB_OUTPUT
+          echo "Building Kopia version: ${VERSION}"
+
+  build-and-push:
+    name: Build multi-arch Docker images and push
+    needs: get-version
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=raw,value=${{ needs.get-version.outputs.version }}
+            type=raw,value=latest
+
+      - name: Build and push multi-arch image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          platforms: linux/amd64,linux/arm64,linux/arm/v7,linux/ppc64le,linux/s390x,linux/riscv64
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            KOPIA_VERSION=${{ needs.get-version.outputs.version }}
+            GITHUB_REPOSITORY=${{ github.repository }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  export-binaries:
+    name: Extract binaries from pushed images and upload artifacts
+    needs:
+      - get-version
+      - build-and-push
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            output_name: x86_64
+          - platform: linux/arm64
+            output_name: aarch64
+          - platform: linux/arm/v7
+            output_name: armv7
+          - platform: linux/ppc64le
+            output_name: ppc64le
+          - platform: linux/s390x
+            output_name: s390x
+          - platform: linux/riscv64
+            output_name: riscv64
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Pull platform-specific image
+        id: pull
+        run: |
+          set -eux
+          IMAGE="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.get-version.outputs.version }}"
+          echo "Pulling ${IMAGE} for platform ${{ matrix.platform }}"
+          docker pull --platform=${{ matrix.platform }} "${IMAGE}"
+          echo "image=${IMAGE}" >> $GITHUB_OUTPUT
+
+      - name: Create container and copy binaries
+        id: extract
+        run: |
+          set -eux
+          IMAGE="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.get-version.outputs.version }}"
+          OUTDIR="release/${{ matrix.output_name }}"
+          mkdir -p "${OUTDIR}"
+
+          CID=$(docker create --platform=${{ matrix.platform }} "${IMAGE}")
+          echo "created container ${CID}"
+
+          if docker cp "${CID}:/usr/local/bin/kopia" "${OUTDIR}/kopia-${{ matrix.output_name }}-linux"; then
+            chmod +x "${OUTDIR}/kopia-${{ matrix.output_name }}-linux" || true
+            echo "Copied kopia binary"
+          else
+            echo "kopia binary not found in image for platform ${{ matrix.platform }}"
+            exit 1
+          fi
+
+          docker rm "${CID}" >/dev/null || true
+          ls -la "${OUTDIR}" || true
+          echo "outdir=${OUTDIR}" >> $GITHUB_OUTPUT
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: kopia-${{ matrix.output_name }}-linux
+          path: release/${{ matrix.output_name }}/*
+
+  create-release:
+    name: Create Release
+    needs: [get-version, build-and-push, export-binaries]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download all artifacts (all arches)
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Prepare release assets
+        run: |
+          mkdir -p release
+          for arch in x86_64 aarch64 armv7 ppc64le s390x riscv64; do
+            if [ -d "artifacts/kopia-${arch}-linux" ]; then
+              cp artifacts/kopia-${arch}-linux/* release/ || true
+            fi
+          done
+          ls -la release
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: ${{ needs.get-version.outputs.version }}
+          name: ${{ needs.get-version.outputs.version }}
+          body: |
+            Built from [kopia/kopia@${{ needs.get-version.outputs.version }}](https://github.com/kopia/kopia/releases/tag/${{ needs.get-version.outputs.version }})
+          files: release/*
+          draft: false
+          prerelease: false
